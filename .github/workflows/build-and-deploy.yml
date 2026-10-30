@@ -1,0 +1,121 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the configured remote Kubernetes cluster
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-prefix: ${{ steps.image-names.outputs.prefix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        id: image-names
+        shell: bash
+        run: echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./springboot/app
+          push: true
+          tags: |
+            ${{ steps.image-names.outputs.prefix }}/backend:${{ github.sha }}
+            ${{ steps.image-names.outputs.prefix }}/backend:latest
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./angular-app
+          push: true
+          tags: |
+            ${{ steps.image-names.outputs.prefix }}/frontend:${{ github.sha }}
+            ${{ steps.image-names.outputs.prefix }}/frontend:latest
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+      INGRESS_HOST: ${{ vars.INGRESS_HOST }}
+      IMAGE_PREFIX: ${{ needs.build-and-push.outputs.image-prefix }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Configure Kubernetes access
+        shell: bash
+        run: |
+          for name in KUBE_CONFIG_DATA MYSQL_ROOT_PASSWORD GHCR_USERNAME GHCR_READ_TOKEN INGRESS_HOST; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Configure the GitHub secret or variable: $name"
+              exit 1
+            fi
+          done
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_DATA" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl get nodes
+
+      - name: Create Kubernetes secrets
+        shell: bash
+        run: |
+          kubectl create secret generic mysql-credentials \
+            --from-literal=root-password="$MYSQL_ROOT_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username="$GHCR_USERNAME" \
+            --docker-password="$GHCR_READ_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default --type=merge \
+            -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+
+      - name: Set remote images and hostname
+        shell: bash
+        run: |
+          sed -i "s|image: test-backend:1.2|image: ${IMAGE_PREFIX}/backend:${IMAGE_TAG}|" k8s/backend-deployment.yaml
+          sed -i "s|image: test-frontend:1.1|image: ${IMAGE_PREFIX}/frontend:${IMAGE_TAG}|" k8s/frontend-deployment.yaml
+          sed -i "s|host: localhost|host: ${INGRESS_HOST}|" k8s/frontend-ingress.yaml
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -f k8s
+
+      - name: Wait for deployments
+        run: |
+          kubectl rollout status deployment/mysql --timeout=300s
+          kubectl rollout status deployment/backend --timeout=300s
+          kubectl rollout status deployment/frontend --timeout=300s

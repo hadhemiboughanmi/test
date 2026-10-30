@@ -8,6 +8,19 @@
   background-color: #f0f0f0; /* Optional background color for the <div> */
 }
 
+.page-header {
+  margin-bottom: 20px;
+  text-align: center;
+}
+
+.page-header h1 {
+  margin-bottom: 6px;
+}
+
+.page-header p {
+  margin: 0;
+}
+
 .table-container {
   /* Styles for the container of the centered <table> */
   background-color: #6be03d; /* Optional background color for the container */
